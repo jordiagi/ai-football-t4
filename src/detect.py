@@ -24,21 +24,29 @@ def _clamp_chunk_seconds(chunk_seconds: int) -> int:
 
 
 def _load_tracker() -> Any:
-    """Load ByteTrack from boxmot with basic API compatibility handling."""
+    """Load ByteTrack from boxmot, compatible with both old and new API."""
+    # boxmot v16+: ByteTrack at new path with kwargs constructor
     try:
-        from boxmot.trackers.bytetrack.byte_tracker import BYTETracker
-    except Exception as exc:
+        from boxmot.trackers.bytetrack.bytetrack import ByteTrack
+        return ByteTrack(det_thresh=0.25, max_age=30, min_hits=1, iou_threshold=0.8)
+    except ImportError:
+        pass
+
+    # boxmot <v16 fallback: BYTETracker with Args object
+    try:
+        from boxmot.trackers.bytetrack.byte_tracker import BYTETracker  # type: ignore
+
+        class Args:
+            track_thresh = 0.25
+            track_buffer = 30
+            match_thresh = 0.8
+            mot20 = False
+
+        return BYTETracker(Args())
+    except ImportError as exc:
         raise RuntimeError(
-            "boxmot ByteTrack is not available. Install/verify `boxmot>=10.0`."
+            "boxmot ByteTrack is not available. Install `boxmot`."
         ) from exc
-
-    class Args:
-        track_thresh = 0.25
-        track_buffer = 30
-        match_thresh = 0.8
-        mot20 = False
-
-    return BYTETracker(Args())
 
 
 def _save_chunk_checkpoint(path: Path, payload: Dict[str, Any]) -> None:
@@ -55,14 +63,15 @@ def _load_chunk_checkpoint(path: Path) -> Optional[Dict[str, Any]]:
 
 
 def _yolo_person_detections(model: YOLO, frame: np.ndarray, person_class_id: int) -> np.ndarray:
-    """Return detections in [x1,y1,x2,y2,conf] for person class only."""
+    """Return detections in [x1,y1,x2,y2,conf,cls] for person class only.
+    6-column format required by boxmot v16+ trackers."""
     results = model.predict(frame, verbose=False)
     if not results:
-        return np.empty((0, 5), dtype=np.float32)
+        return np.empty((0, 6), dtype=np.float32)
 
     boxes = results[0].boxes
     if boxes is None or boxes.xyxy is None:
-        return np.empty((0, 5), dtype=np.float32)
+        return np.empty((0, 6), dtype=np.float32)
 
     cls = boxes.cls.detach().cpu().numpy() if boxes.cls is not None else np.array([])
     xyxy = boxes.xyxy.detach().cpu().numpy() if boxes.xyxy is not None else np.empty((0, 4))
@@ -70,17 +79,23 @@ def _yolo_person_detections(model: YOLO, frame: np.ndarray, person_class_id: int
 
     keep = cls.astype(int) == person_class_id
     if keep.size == 0 or not keep.any():
-        return np.empty((0, 5), dtype=np.float32)
+        return np.empty((0, 6), dtype=np.float32)
 
-    dets = np.concatenate([xyxy[keep], conf[keep, None]], axis=1)
+    dets = np.concatenate([xyxy[keep], conf[keep, None], cls[keep, None]], axis=1)
     return dets.astype(np.float32)
 
 
 def _tracker_update(tracker: Any, dets: np.ndarray, frame: np.ndarray) -> List[Dict[str, Any]]:
-    """Convert ByteTrack output variants into normalized tracked detections."""
+    """Convert ByteTrack output into normalized tracked detections.
+
+    boxmot v16+ update(dets, img) returns ndarray [x1,y1,x2,y2,id,conf,cls,det_ind].
+    Older API returned objects with .tlbr / .track_id attributes.
+    """
     tracks_out: List[Dict[str, Any]] = []
 
-    # boxmot BYTETracker update signatures vary by release; try common call forms.
+    if dets.shape[0] == 0:
+        return tracks_out
+
     track_result = None
     for call in (
         lambda: tracker.update(dets, frame),
@@ -92,37 +107,33 @@ def _tracker_update(tracker: Any, dets: np.ndarray, frame: np.ndarray) -> List[D
         except TypeError:
             continue
 
-    if track_result is None:
+    if track_result is None or (isinstance(track_result, np.ndarray) and track_result.size == 0):
         return tracks_out
 
     if isinstance(track_result, np.ndarray):
-        # Expected shape: [x1,y1,x2,y2,track_id,score,...]
+        # v16+: [x1, y1, x2, y2, track_id, conf, cls, det_ind]
         for row in track_result:
-            if len(row) < 6:
+            if len(row) < 5:
                 continue
-            tracks_out.append(
-                {
-                    "track_id": int(row[4]),
-                    "bbox": [float(row[0]), float(row[1]), float(row[2]), float(row[3])],
-                    "score": float(row[5]),
-                }
-            )
+            tracks_out.append({
+                "track_id": int(row[4]),
+                "bbox": [float(row[0]), float(row[1]), float(row[2]), float(row[3])],
+                "score": float(row[5]) if len(row) > 5 else 1.0,
+            })
         return tracks_out
 
-    # Alternate API where objects expose fields.
+    # Legacy object-based API
     for t in track_result:
         tlbr = getattr(t, "tlbr", None)
         track_id = getattr(t, "track_id", None)
         score = getattr(t, "score", 1.0)
         if tlbr is None or track_id is None:
             continue
-        tracks_out.append(
-            {
-                "track_id": int(track_id),
-                "bbox": [float(tlbr[0]), float(tlbr[1]), float(tlbr[2]), float(tlbr[3])],
-                "score": float(score),
-            }
-        )
+        tracks_out.append({
+            "track_id": int(track_id),
+            "bbox": [float(tlbr[0]), float(tlbr[1]), float(tlbr[2]), float(tlbr[3])],
+            "score": float(score),
+        })
 
     return tracks_out
 
