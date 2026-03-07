@@ -1,0 +1,14 @@
+{
+  "id": "yfbjordiyehyfam/ai-football-t4",
+  "title": "ai-football-t4",
+  "code_file": "notebooks/01_pipeline_t4.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_tpu": false,
+  "enable_internet": true,
+  "dataset_sources": [],
+  "competition_sources": [],
+  "kernel_sources": []
+}
